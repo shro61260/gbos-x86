@@ -1,0 +1,24 @@
+name: Build gbOS86
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Build gbOS86
+        run: printf '2\n128\ny\n' | ./build.sh
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: gbos86-image
+          path: dist/*.img
+          retention-days: 1
