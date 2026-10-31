@@ -1,0 +1,64 @@
+name: serve-image-tunnel
+
+# Serves the reassembled single .img from the runner through an ephemeral Cloudflare
+# quick tunnel, so Google Drive can pull it in server-side. The URL dies with the job.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Reassemble and verify the single image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          D="$RUNNER_TEMP/img"
+          mkdir -p "$D" && cd "$D"
+          gh release download gbos86-image --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.part*' --pattern '*.sha256'
+          cat gbOS86-*.img.part* > gbOS86-20261031.img
+          sha256sum -c gbOS86-20261031.img.sha256
+          ls -l gbOS86-20261031.img
+
+      - name: Install cloudflared
+        run: |
+          set -eu
+          curl -sSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared --version
+
+      - name: Serve the file and publish the tunnel URL
+        run: |
+          set -eu
+          D="$RUNNER_TEMP/img"
+          cd "$D"
+          nohup python3 -m http.server 8080 --bind 127.0.0.1 > /tmp/http.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > /tmp/cf.log 2>&1 &
+          URL=""
+          for i in $(seq 1 90); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "no tunnel url"; cat /tmp/cf.log; exit 1; fi
+          FULL="$URL/gbOS86-20261031.img"
+          echo "TUNNEL_URL=$FULL"
+          curl -sS -o /dev/null -w 'self-check http=%{http_code} bytes=%{size_download}\n' --max-time 600 -r 0-1048575 "$FULL" || true
+          cd "$GITHUB_WORKSPACE"
+          echo "$FULL" > tunnel.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B tunnel
+          git add tunnel.txt
+          git commit -m "tunnel url for $(date -u +%FT%TZ)" || true
+          git push -f origin tunnel
+
+      - name: Keep the tunnel alive
+        run: sleep 3300
