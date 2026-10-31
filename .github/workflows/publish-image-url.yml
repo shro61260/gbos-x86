@@ -11,7 +11,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Reassemble and verify the single image
         env:
@@ -25,38 +25,51 @@ jobs:
           cat gbOS86-*.img.part* > gbOS86-20261031.img
           sha256sum -c gbOS86-20261031.img.sha256
           ls -l gbOS86-20261031.img
-          df -h .
 
-      - name: Upload to a temporary public host
+      - name: Upload to temporary hosts, keep the first that serves all bytes
         run: |
-          set -eu
+          set -u
           cd "$RUNNER_TEMP/img"
-          URL=""
-          echo "-- trying pixeldrain"
-          RESP=$(curl -sS --max-time 3600 -T gbOS86-20261031.img \
-                 "https://pixeldrain.com/api/file/gbOS86-20261031.img" || true)
-          echo "pixeldrain said: $RESP"
-          ID=$(printf '%s' "$RESP" | jq -r '.id // empty' 2>/dev/null || true)
-          if [ -n "$ID" ]; then
-            URL="https://pixeldrain.com/api/file/$ID?download"
-          fi
-          if [ -z "$URL" ]; then
-            echo "-- pixeldrain failed, trying filebin"
-            BIN="gbos86-$(date +%s)"
-            curl -sS --max-time 3600 -X POST \
-              --data-binary @gbOS86-20261031.img \
-              "https://filebin.net/$BIN/gbOS86-20261031.img" >/dev/null || true
-            URL="https://filebin.net/$BIN/gbOS86-20261031.img"
-          fi
-          echo "DIRECT_URL=$URL" >> "$GITHUB_ENV"
-          echo "DIRECT_URL=$URL" >> "$GITHUB_STEP_SUMMARY"
-          echo "hosted at: $URL"
+          EXPECT=6712983552
+          F=gbOS86-20261031.img
+          : > candidates.txt
 
-      - name: Check the URL serves the whole file
-        run: |
-          set -eu
-          echo "URL: $DIRECT_URL"
-          curl -sIL --max-time 120 "$DIRECT_URL" | grep -iE 'HTTP/|content-length|content-type|location' || true
-          SIZE=$(curl -sL --max-time 300 "$DIRECT_URL" | wc -c)
-          echo "served bytes: $SIZE"
-          [ "$SIZE" -eq 6712983552 ] && echo "SIZE_OK" || echo "SIZE_MISMATCH expected 6712983552"
+          echo "== 1) bashupload.com"
+          OUT=$(curl -sS --max-time 3000 -T "$F" bashupload.com 2>&1 || true)
+          echo "$OUT" | tail -3
+          BU=$(printf '%s' "$OUT" | grep -oE 'https://bashupload\.com/[A-Za-z0-9._/-]+' | head -1 || true)
+          [ -n "$BU" ] && echo "bashupload $BU" >> candidates.txt
+
+          echo "== 2) oshi.at"
+          OUT2=$(curl -sS --max-time 3000 -T "$F" -H "Expires: 1440" https://oshi.at 2>&1 || true)
+          echo "$OUT2" | tail -3
+          OS=$(printf '%s' "$OUT2" | grep -oE 'https://oshi\.at/[A-Za-z0-9._/-]+' | head -1 || true)
+          [ -n "$OS" ] && echo "oshi $OS" >> candidates.txt
+
+          echo "== 3) gofile.io"
+          SRV=$(curl -sS --max-time 60 https://api.gofile.io/servers | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+          if [ -n "$SRV" ]; then
+            OUT3=$(curl -sS --max-time 3000 -F "file=@$F" "https://$SRV.gofile.io/contents/uploadfile" || true)
+            echo "$OUT3" | head -c 400; echo
+            GID=$(printf '%s' "$OUT3" | jq -r '.data.id // empty' 2>/dev/null || true)
+            [ -n "$GID" ] && echo "gofile https://$SRV.gofile.io/download/$GID/$F" >> candidates.txt
+          fi
+
+          echo "---- candidates ----"; cat candidates.txt || true
+          echo "---- checking which one serves all $EXPECT bytes ----"
+          : > chosen.txt
+          while read -r host url; do
+            [ -n "${url:-}" ] || continue
+            echo "checking $host $url"
+            GOT=$(curl -sSL --max-time 3000 "$url" | wc -c)
+            echo "  $host served $GOT of $EXPECT"
+            if [ "$GOT" -eq "$EXPECT" ]; then echo "$url" > chosen.txt; break; fi
+          done < candidates.txt
+          if [ -s chosen.txt ]; then
+            echo "DIRECT_URL=$(cat chosen.txt)" >> "$GITHUB_ENV"
+            echo "DIRECT_URL=$(cat chosen.txt)" >> "$GITHUB_STEP_SUMMARY"
+            echo "CHOSEN: $(cat chosen.txt)"
+          else
+            echo "NO_WORKING_HOST" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
