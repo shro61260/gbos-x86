@@ -35,6 +35,8 @@ jobs:
           /tmp/cloudflared --version
 
       - name: Serve the file and publish the tunnel URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           D="$RUNNER_TEMP/img"
@@ -50,15 +52,26 @@ jobs:
           if [ -z "$URL" ]; then echo "no tunnel url"; cat /tmp/cf.log; exit 1; fi
           FULL="$URL/gbOS86-20261031.img"
           echo "TUNNEL_URL=$FULL"
-          curl -sS -o /dev/null -w 'self-check http=%{http_code} bytes=%{size_download}\n' --max-time 600 -r 0-1048575 "$FULL" || true
-          cd "$GITHUB_WORKSPACE"
-          echo "$FULL" > tunnel.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -B tunnel
-          git add tunnel.txt
-          git commit -m "tunnel url for $(date -u +%FT%TZ)" || true
-          git push -f origin tunnel
+          # DNS for a brand-new quick tunnel can lag; retry before declaring failure.
+          OK=0
+          for i in $(seq 1 20); do
+            R=$(curl -sS -o /dev/null -w '%{http_code} %{size_download}' --max-time 60 -r 0-1048575 "$FULL" 2>/dev/null || true)
+            echo "self-check $i: $R"
+            case "$R" in "200 1048576"|"206 1048576") OK=1; break;; esac
+            sleep 5
+          done
+          echo "self-check ok=$OK"
+          B64=$(printf '%s' "$FULL" | base64 -w0)
+          SHA=$(gh api "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" --jq '.sha' 2>/dev/null || true)
+          if [ -n "$SHA" ]; then
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" \
+              -f message="tunnel url $(date -u +%FT%TZ)" -f content="$B64" -f sha="$SHA" -f branch=main >/dev/null
+          else
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" \
+              -f message="tunnel url $(date -u +%FT%TZ)" -f content="$B64" -f branch=main >/dev/null
+          fi
+          echo "published tunnel.txt"
+          [ "$OK" = 1 ] || echo "::warning::tunnel self-check did not pass from the runner"
 
       - name: Keep the tunnel alive
         run: sleep 3300
