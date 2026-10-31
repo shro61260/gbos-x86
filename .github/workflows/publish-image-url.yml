@@ -1,0 +1,62 @@
+name: publish-image-url
+
+# Reassembles the single .img from the release chunks and hands it to a temporary
+# public host so Google Drive can pull it in server-side (UPLOAD_FROM_URL).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Reassemble and verify the single image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          D="$RUNNER_TEMP/img"
+          mkdir -p "$D" && cd "$D"
+          gh release download gbos86-image --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.part*' --pattern '*.sha256'
+          cat gbOS86-*.img.part* > gbOS86-20261031.img
+          sha256sum -c gbOS86-20261031.img.sha256
+          ls -l gbOS86-20261031.img
+          df -h .
+
+      - name: Upload to a temporary public host
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/img"
+          URL=""
+          echo "-- trying pixeldrain"
+          RESP=$(curl -sS --max-time 3600 -T gbOS86-20261031.img \
+                 "https://pixeldrain.com/api/file/gbOS86-20261031.img" || true)
+          echo "pixeldrain said: $RESP"
+          ID=$(printf '%s' "$RESP" | jq -r '.id // empty' 2>/dev/null || true)
+          if [ -n "$ID" ]; then
+            URL="https://pixeldrain.com/api/file/$ID?download"
+          fi
+          if [ -z "$URL" ]; then
+            echo "-- pixeldrain failed, trying filebin"
+            BIN="gbos86-$(date +%s)"
+            curl -sS --max-time 3600 -X POST \
+              --data-binary @gbOS86-20261031.img \
+              "https://filebin.net/$BIN/gbOS86-20261031.img" >/dev/null || true
+            URL="https://filebin.net/$BIN/gbOS86-20261031.img"
+          fi
+          echo "DIRECT_URL=$URL" >> "$GITHUB_ENV"
+          echo "DIRECT_URL=$URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "hosted at: $URL"
+
+      - name: Check the URL serves the whole file
+        run: |
+          set -eu
+          echo "URL: $DIRECT_URL"
+          curl -sIL --max-time 120 "$DIRECT_URL" | grep -iE 'HTTP/|content-length|content-type|location' || true
+          SIZE=$(curl -sL --max-time 300 "$DIRECT_URL" | wc -c)
+          echo "served bytes: $SIZE"
+          [ "$SIZE" -eq 6712983552 ] && echo "SIZE_OK" || echo "SIZE_MISMATCH expected 6712983552"
