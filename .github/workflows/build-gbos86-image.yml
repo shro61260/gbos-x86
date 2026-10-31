@@ -1,0 +1,123 @@
+name: build-gbos86-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "standard = live USB installer (MODE=ask); looper = persistent /data (MODE=boot)"
+        type: choice
+        options:
+          - standard
+          - looper
+        default: standard
+      release_tag:
+        description: "Release tag to create and upload the image to"
+        default: gbos86-image
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Runner disk before cleanup
+        run: df -h
+
+      - name: Reclaim disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Pick a build directory with at least 45 GB free
+        id: pick
+        run: |
+          set -eu
+          for cand in /mnt/gbos86 "$RUNNER_TEMP/gbos86" "$GITHUB_WORKSPACE/gbos86"; do
+            mkdir -p "$cand" 2>/dev/null || continue
+            free_kb=$(df -Pk "$cand" | awk 'NR==2{print $4}')
+            echo "$cand has $((free_kb / 1024 / 1024)) GiB free"
+            if [ "$free_kb" -ge 45000000 ]; then
+              echo "dir=$cand" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::warning::no location had 45 GB free; falling back to the workspace"
+          echo "dir=$GITHUB_WORKSPACE/gbos86" >> "$GITHUB_OUTPUT"
+
+      - name: Clone the repository
+        run: |
+          set -eu
+          cd "${{ steps.pick.outputs.dir }}"
+          git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" src
+          cd src
+          echo "building $(git rev-parse --short HEAD)"
+          df -h .
+
+      - name: Build the image
+        working-directory: ${{ steps.pick.outputs.dir }}/src
+        run: |
+          set -eu
+          docker info >/dev/null
+          chmod +x build.sh tools/*.sh
+          ./build.sh -y --${{ inputs.build_type }}
+          echo "---- dist ----"
+          ls -lh dist/
+          df -h .
+
+      - name: Checksum and split for release assets
+        working-directory: ${{ steps.pick.outputs.dir }}/src
+        run: |
+          set -eu
+          cd dist
+          IMG=$(ls -1 gbOS86-*.img | head -1)
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          sha256sum "$IMG" | tee "$IMG.sha256"
+          # GitHub caps a single release asset at 2 GB, so split into 1800 MiB chunks.
+          split -b 1800M -d -a 1 "$IMG" "$IMG.part"
+          ls -lh
+          {
+            echo "### gbOS86 image built"
+            echo
+            echo '```'
+            cat "$IMG.sha256"
+            echo '```'
+            echo
+            echo "Reassemble the chunks on your machine:"
+            echo
+            echo '```sh'
+            echo "cat $IMG.part* > $IMG"
+            echo "sha256sum -c $IMG.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the release and upload the chunks
+        working-directory: ${{ steps.pick.outputs.dir }}/src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -eu
+          cd dist
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "gbOS86 $IMG" \
+              --notes "gbOS86 image (${{ inputs.build_type }}) built by GitHub Actions from ${GITHUB_REPOSITORY} at ${GITHUB_SHA}. Reassemble with: cat $IMG.part* > $IMG"
+          fi
+          gh release upload "$TAG" "$IMG.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+          for f in "$IMG".part*; do
+            echo "uploading $f"
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          echo "---- assets on the release ----"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            -q '.assets[] | "\(.name)  \(.size)"'
+
+      - name: Keep logs on failure
+        if: failure()
+        run: |
+          df -h
+          echo "see the step logs above for the failing stage"
