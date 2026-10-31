@@ -34,7 +34,7 @@ jobs:
           chmod +x /tmp/cloudflared
           /tmp/cloudflared --version
 
-      - name: Serve the file and publish the tunnel URL
+      - name: Serve the file and publish the tunnel URL immediately
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -52,15 +52,6 @@ jobs:
           if [ -z "$URL" ]; then echo "no tunnel url"; cat /tmp/cf.log; exit 1; fi
           FULL="$URL/gbOS86-20261031.img"
           echo "TUNNEL_URL=$FULL"
-          # DNS for a brand-new quick tunnel can lag; retry before declaring failure.
-          OK=0
-          for i in $(seq 1 20); do
-            R=$(curl -sS -o /dev/null -w '%{http_code} %{size_download}' --max-time 60 -r 0-1048575 "$FULL" 2>/dev/null || true)
-            echo "self-check $i: $R"
-            case "$R" in "200 1048576"|"206 1048576") OK=1; break;; esac
-            sleep 5
-          done
-          echo "self-check ok=$OK"
           B64=$(printf '%s' "$FULL" | base64 -w0)
           SHA=$(gh api "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" --jq '.sha' 2>/dev/null || true)
           if [ -n "$SHA" ]; then
@@ -71,7 +62,11 @@ jobs:
               -f message="tunnel url $(date -u +%FT%TZ)" -f content="$B64" -f branch=main >/dev/null
           fi
           echo "published tunnel.txt"
-          [ "$OK" = 1 ] || echo "::warning::tunnel self-check did not pass from the runner"
 
-      - name: Keep the tunnel alive
-        run: sleep 3300
+      - name: Report and keep the tunnel alive
+        run: |
+          set -u
+          curl -sS -o /dev/null -w 'runner self-check http=%{http_code} bytes=%{size_download}\n' \
+            --connect-timeout 10 --max-time 30 -r 0-1048575 "$(cat tunnel.txt 2>/dev/null || true)" 2>&1 | tail -2 || true
+          tail -5 /tmp/cf.log || true
+          sleep 3300
