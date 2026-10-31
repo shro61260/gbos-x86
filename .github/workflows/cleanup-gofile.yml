@@ -1,0 +1,45 @@
+name: cleanup-gofile
+
+# Removes the temporary public copy made during a failed publish attempt, and the
+# tunnel URL file, from the fork. Run manually.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete the temporary gofile copy
+        run: |
+          set -u
+          ID=40f21dd6-7989-403d-8c41-1e7f2c2f10ac
+          TOK=BLf3xzqiOKD2y6TnqM164AYjPy2ix1QI
+          echo "-- DELETE via query params"
+          curl -sS -X DELETE "https://api.gofile.io/contents?contentsId=$ID&token=$TOK" || true
+          echo
+          echo "-- DELETE via JSON body"
+          curl -sS -X DELETE -H 'Content-Type: application/json' \
+            -d "{\"contentsId\":\"$ID\",\"token\":\"$TOK\"}" \
+            https://api.gofile.io/contents || true
+          echo
+          echo "-- check the direct link is gone"
+          curl -sS -o /dev/null -w 'direct link http=%{http_code} bytes=%{size_download}\n' \
+            -H "Cookie: accountToken=$TOK" \
+            "https://store-na-phx-5.gofile.io/download/$ID/gbOS86-20261031.img" || true
+
+      - name: Remove tunnel.txt from the repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          SHA=$(gh api "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" --jq '.sha' 2>/dev/null || true)
+          if [ -n "$SHA" ]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/contents/tunnel.txt" \
+              -f message="remove tunnel url" -f sha="$SHA" && echo "tunnel.txt removed"
+          else
+            echo "tunnel.txt already gone"
+          fi
