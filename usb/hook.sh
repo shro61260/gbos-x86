@@ -1,6 +1,12 @@
 # gbos pre-Android hook: sourced by stage0 just before switch_root (Android root at /new,
 # helpers log/fail/shell and $G=/gbos/gbos available). Edit freely, no kernel rebuild needed.
 
+# Reset one-shot MODE=live back to MODE=ask so subsequent boots prompt the user
+if [ -f "$G/gbos.cfg" ] && grep -q '^MODE=live' "$G/gbos.cfg" 2>/dev/null; then
+  sed -i 's/^MODE=live/MODE=ask/' "$G/gbos.cfg" 2>/dev/null || true
+  sync 2>/dev/null || true
+fi
+
 # Library patches. patched/MANIFEST (written by tools/port_build.py) has one line per patch: kind, the path in the Android root
 # (/new/...), the sha256 of the exact original the patch was made from, and the patched file (relative to gbos/). A patch is
 # bound only over a file with that hash, so a new Google build never gets a stale patch: the line says "NOT patched" and shows
@@ -33,13 +39,20 @@ gbos_bind_patches() {
   done < $G/patched/MANIFEST
   log "hook: PATCH-STATUS $gp_ok applied, $gp_bad not applied"
 }
-# Google's userspace needs AVX: the first instructions of its dynamic linker (__linker_init: vxorps/vmovups ymm) are VEX-encoded,
-# and the kernel's emulator only covers the *newer* extensions (GFNI, VNNI, SHA-NI, ...), not baseline AVX. A CPU without AVX
-# (many Celeron/Pentium/Atom parts) kills init at once ("traps: init[1] trap invalid opcode ... in linker64", then a silent hang).
-# Say so on screen instead. REQUIRE_AVX=0 in gbos.cfg boots anyway.
-if [ "${REQUIRE_AVX:-1}" != 0 ] && ! grep -qw avx ${CPUINFO:-/proc/cpuinfo}; then
-  log "CPU: $(grep -m1 'model name' ${CPUINFO:-/proc/cpuinfo})"
-  fail "this CPU has no AVX, so Google's init cannot run on it (not fixable by drivers). Power off, or type exit to try anyway (REQUIRE_AVX=0 in gbos.cfg skips this check)."
+# Google's userspace needs AVX2: the dynamic linker and bionic libc (__linker_init: vxorps/vmovups ymm, vpbroadcastb)
+# use AVX2 instructions, and the kernel's emulator only covers the newer extensions (GFNI, VNNI, SHA-NI, ...),
+# not baseline AVX/AVX2. A CPU without AVX2 (Celeron/Pentium/Atom, or 2nd/3rd Gen Sandy/Ivy Bridge) kills init
+# with SIGILL (exitcode=0x00000004), leading to a kernel panic. Say so on screen instead.
+# REQUIRE_AVX=0 in gbos.cfg boots anyway.
+if [ "${REQUIRE_AVX:-1}" != 0 ]; then
+  if ! grep -qw avx2 ${CPUINFO:-/proc/cpuinfo}; then
+    log "CPU: $(grep -m1 'model name' ${CPUINFO:-/proc/cpuinfo})"
+    if ! grep -qw avx ${CPUINFO:-/proc/cpuinfo}; then
+      fail "this CPU has no AVX, so Google's init cannot run on it (not fixable by drivers). Power off, or type exit to try anyway (REQUIRE_AVX=0 in gbos.cfg skips this check)."
+    else
+      fail "this CPU lacks AVX2 instruction support (Sandy/Ivy Bridge 2nd/3rd Gen). Google's userspace executes AVX2 (vpbroadcastb) in init/linker64, requiring Intel 4th Gen Haswell / 6th Gen Skylake+ or AMD Zen. Power off, or type exit to try anyway (REQUIRE_AVX=0 in gbos.cfg skips this check)."
+    fi
+  fi
 fi
 
 # zram is a module here (=m in Google's config too); mmd_setup aborts without /sys/block/zram0.
@@ -133,15 +146,16 @@ gbos_gpu_decide() {
       drv=${e#*,}
       case "$drv" in i915|xe) intel=$drv;; *) gbos_gpu_real "$drv" && real="$real ${e%%,*}:$drv";; esac
     done
-    # Intel (bound, or at least present on the PCI bus): leave everything as it is, whatever else is installed.
+    # Intel driver bound: hardware acceleration active, leave software rendering off
     [ -n "$intel" ] && { log "hook: software rendering: off (auto; Intel GPU driver $intel bound)"; return 0; }
-    gbos_gpu_intel_pci && { log "hook: software rendering: off (auto; Intel display controller present)"; return 0; }
     [ -n "$real" ] && break
     [ $w -ge ${1:-0} ] && break
     sleep 1; w=$((w+1))
   done
   if [ -n "$real" ]; then
     GPU_SW=1; log "hook: software rendering: on (auto; no Intel GPU, DRM:$real, after ${w}s)"
+  elif [ -z "$intel" ] && gbos_gpu_intel_pci; then
+    GPU_SW=1; log "hook: software rendering: on (auto; Intel GPU present but no DRM driver bound after ${w}s; falling back to CPU Vulkan)"
   else
     log "hook: software rendering: off (auto; no DRM GPU driver bound after ${w}s; cards: $(gbos_gpu_cards | tr '\n' ';'))"
   fi
@@ -192,8 +206,19 @@ if [ -f $G/bootdisk.img ]; then
     ln -sf /dev/block/loop6p$i /dev/block/by-name/$n
     i=$((i+1))
   done
+  for b in boot_a boot_b vendor_boot_a vendor_boot_b init_boot_a init_boot_b; do
+    ln -sf /dev/block/loop6p1 /dev/block/by-name/$b
+  done
   log "hook: bootdisk on loop6: $(ls /sys/class/block | grep loop6p | tr '\n' ' ')"
 fi
+
+# Mask SetupWizard APK directories so Android skips initial setup and launches Desktop directly
+mkdir -p /tmp/empty_suw
+for suw_dir in /new/product/priv-app/*SetupWizard* /new/system_ext/priv-app/*SetupWizard* /new/product/priv-app/*setupwizard* /new/system_ext/priv-app/*setupwizard*; do
+  if [ -d "$suw_dir" ]; then
+    mount --bind /tmp/empty_suw "$suw_dir" && log "hook: masked $suw_dir with empty dir"
+  fi
+done
 
 # Fake crossystem (no ChromeOS firmware on this laptop)
 [ -f $G/crossystem ] && mount --bind $G/crossystem /new/vendor/bin/crossystem && log "hook: crossystem faked"
@@ -216,6 +241,9 @@ gbos_touchpads() {
 if mount --bind /gbos /new/postinstall; then
   mkdir -p /tmp/sysinit && cp -a /new/system/etc/init/. /tmp/sysinit/
   rm -f /tmp/sysinit/gscd.rc   # gscd needs Google's security chip (/dev/tpm0); it only crash-loops here
+  rm -f /tmp/sysinit/timberslide.rc # timberslide needs ChromeOS EC (/dev/cros_ec); crash-loops on generic PCs
+  rm -f /tmp/sysinit/udsattestation.rc # udsattestation needs Titan C security chip; loops on generic PCs
+  rm -f /tmp/sysinit/mmd.rc            # disable mmd & 24GB zram/8GB disk swap on pendrive
   # RESOLUTION in gbos.cfg: logical display size (e.g. 2400x1350) that SurfaceFlinger renders at and the
   # display hardware scales to the 1920x1080 panel, so everything looks smaller with stock density.
   case "$RESOLUTION" in [0-9]*x[0-9]*) WMSIZE=$RESOLUTION;; *) WMSIZE=reset;; esac
@@ -244,7 +272,8 @@ if mount --bind /gbos /new/postinstall; then
 # Rotate at 1 MB: on this stick, data written past ~4 MB of a file that stays open never reaches
 # the FAT cluster chain before power-off (fsck: "size ... should at most be 4046848"). Rotating
 # closes each file; logcat.txt is newest, then logcat.txt.1, .2, ...
-service gbos_logcat /system/bin/logcat -b all -v threadtime -r 1024 -n 99 -f /postinstall/gbos/logs/boot-$N/logcat.txt
+# Rotate at 1 MB, keep last 10 files to reduce USB flash drive write wear and I/O latency
+service gbos_logcat /system/bin/logcat -b all -v threadtime -r 1024 -n 10 -f /postinstall/gbos/logs/boot-$N/logcat.txt
     user root
     group root log
     seclabel u:r:shell:s0
@@ -256,7 +285,8 @@ service gbos_crashlog /system/bin/logcat -b crash -v threadtime -f /postinstall/
     seclabel u:r:shell:s0
 
 # The laptop is usually powered off by hand, so flush the logs to the stick every 5 s.
-service gbos_sync /system/bin/sh -c "while true; do sleep 5; sync; done"
+# Also executes /postinstall/gbos/run.sh as root backchannel if present.
+service gbos_sync /system/bin/sh -c "while true; do sleep 5; if [ -f /postinstall/gbos/run.sh ]; then sh /postinstall/gbos/run.sh > /postinstall/gbos/run.log 2>&1; rm -f /postinstall/gbos/run.sh; fi; sync; done"
     user root
     group root
     seclabel u:r:shell:s0
@@ -289,6 +319,8 @@ on property:sys.boot_completed=1
     # The KVM exit trace (kvmtrace.txt) only matters while the Trusty VM boots; left on it costs CPU and writes a lot.
     write /sys/kernel/tracing/tracing_on 0
     $TRUSTYSTOP
+    start gbos_skip_setup
+    start gbos_optimize
     start gbos_audiodiag
     start gbos_devname
     start gbos_iptsd
@@ -296,6 +328,22 @@ on property:sys.boot_completed=1
     start gbos_displaydiag
     start gbos_aidiag
     start gbos_ksu
+
+# update_engine runs normally to satisfy GMS binder without crashing
+
+# Skip SetupWizard completely and launch desktop
+service gbos_skip_setup /system/bin/sh -c "sleep 1; settings put --user 0 secure user_setup_complete 1; settings put --user 10 secure user_setup_complete 1; settings put secure user_setup_complete 1; settings put global device_provisioned 1; settings put global setup_wizard_has_run 1; settings put global force_resizable_activities 1; settings put global enable_freeform_support 1; settings put global ota_disable_automatic_update 1; settings put global auto_system_update 0; setprop ro.setupwizard.mode DISABLED; am start --user 10 -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null; am start -n com.google.android.apps.nexuslauncher/.NexusLauncherActivity -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null"
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+
+# GBOS System, Gaming and RAM Optimization Service
+service gbos_optimize /system/bin/sh /postinstall/gbos/optimize.sh
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
 
 # AI diagnostics (Magic Pointer / AICore): usb/aidiag.sh writes logs/boot-N/ai-1.txt (90 s) and ai-2.txt (4 min).
 # The gbos_aidns_* services run one ping per app uid so aidiag can compare DNS as AICore (10107) with
@@ -600,6 +648,9 @@ if [ -f $G/audio/gbos-hda-pch/audio_config.xml ]; then
 fi
 # apgetty (UART shell) has no UART configured here and crash-loops
 : > /tmp/empty.rc && mount --bind /tmp/empty.rc /new/system_ext/etc/init/apgetty.rc && log "hook: apgetty disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/hal_desktop_charge_control_default.rc 2>/dev/null && log "hook: charge_control disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/suspend_notification_service.rc 2>/dev/null && log "hook: suspend_notification disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/suspend_diagnostics.rc 2>/dev/null && log "hook: suspend_diagnostics disabled"
 log "hook: kvm: $(ls /sys/class/misc | grep -E 'kvm|vhost' | tr '\n' ' ')"
 
 # KVM trace -> kvmtrace.txt: guest exceptions / failed emulation / triple faults, to see why the
